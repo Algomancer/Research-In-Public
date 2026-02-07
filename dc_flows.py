@@ -85,15 +85,14 @@ def build_rope_cache(seq_len: int, head_dim: int, device: torch.device,
     dim_per_axis = head_dim // 2
     inv_freq = 1.0 / (base ** (torch.arange(dim_per_axis, device=device).float() / dim_per_axis))
     positions = torch.arange(seq_len, device=device).float()
-    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # (seq_len, dim_per_axis)
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
     return torch.cos(angles), torch.sin(angles)
 
 
 def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    """x: (B, S, H, D), cos/sin: (S, rope_dim) -> (B, S, H, D)"""
     orig_dtype = x.dtype
     x = x.float()
-    cos = cos.float().view(1, -1, 1, cos.shape[-1])   # (1, S, 1, rope_dim)
+    cos = cos.float().view(1, -1, 1, cos.shape[-1])
     sin = sin.float().view(1, -1, 1, sin.shape[-1])
     x_re, x_im = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
     out = torch.stack([x_re * cos - x_im * sin, x_re * sin + x_im * cos], -1)
@@ -106,8 +105,8 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 @dataclass
 class AttnContext:
-    rope_cos: Tensor  # (seq_len, rope_dim)
-    rope_sin: Tensor  # (seq_len, rope_dim)
+    rope_cos: Tensor
+    rope_sin: Tensor
 
 
 def make_ctx(seq_len: int, rope_cos: Tensor, rope_sin: Tensor) -> AttnContext:
@@ -148,7 +147,6 @@ class Attention(nn.Module):
         xavier_init(self.out)
 
     def forward(self, x: Tensor, ctx: AttnContext) -> Tensor:
-        """x: (B, S, dim) -> (B, S, dim)"""
         B, S, _ = x.shape
         q, k, v = self.qkv(x).split(
             [self.heads * self.head_dim, self.kv_heads * self.head_dim,
@@ -161,7 +159,6 @@ class Attention(nn.Module):
         q = apply_rope(q, ctx.rope_cos, ctx.rope_sin)
         k = apply_rope(k, ctx.rope_cos, ctx.rope_sin)
 
-        # (B, S, H, D) -> (B, H, S, D) for SDPA
         out = F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
             scale=self.scale,
@@ -213,56 +210,33 @@ class Backbone(nn.Module):
 
 class CouplingNet(nn.Module):
     """
-    Transformer conditioner for a bipartite coupling layer.
-
-    Takes identity-partition values x_id (batch, n_id) as LongTensor,
-    embeds them alongside n_tr learnable query tokens, runs the full
-    sequence through the transformer backbone, and reads off per-query
-    logits (batch, n_tr, K) for the transform-partition shift parameters.
+    Transformer conditioner. Takes masked one-hot (B, D, K) — identity
+    dims have values, transform dims are zeroed — runs D-position
+    transformer, outputs (B, D, K) logits at every position.
+    Only transform-position outputs are used (via masking in the layer).
     """
 
-    def __init__(self, n_id: int, n_tr: int, K: int, cfg: FlowConfig):
+    def __init__(self, D: int, K: int, cfg: FlowConfig):
         super().__init__()
-        self.n_id = n_id
-        self.n_tr = n_tr
-        self.K = K
         dim = cfg.hidden_dim
 
-        # Input embeddings for identity tokens
-        self.embed = nn.Embedding(K, dim)
-        nn.init.xavier_uniform_(self.embed.weight)
-        self.pos_embed_id = nn.Parameter(torch.randn(n_id, dim) * 0.02)
-
-        # Learnable query tokens for transform dimensions
-        self.query_tokens = nn.Parameter(torch.randn(n_tr, dim) * 0.02)
+        self.embed = nn.Linear(K, dim, bias=False)
+        xavier_init(self.embed)
+        self.pos_embed = nn.Parameter(torch.randn(D, dim) * 0.02)
 
         self.backbone = Backbone(
             dim=dim, depth=cfg.depth, heads=cfg.heads,
             kv_heads=cfg.kv_heads, mlp_mult=cfg.mlp_mult,
         )
 
-        # Per-token head: each query token projects to K logits
         self.head = nn.Linear(dim, K, bias=True)
         xavier_init(self.head)
 
-    def forward(self, x_id: Tensor, ctx: AttnContext) -> Tensor:
-        """
-        x_id: (batch, n_id) LongTensor in {0..K-1}
-        Returns: (batch, n_tr, K) logits
-        """
-        B = x_id.shape[0]
-        # Embed identity tokens: (B, n_id, dim)
-        h_id = self.embed(x_id) + self.pos_embed_id.unsqueeze(0)
-        # Expand query tokens: (B, n_tr, dim)
-        h_query = self.query_tokens.unsqueeze(0).expand(B, -1, -1)
-        # Concatenate: (B, n_id + n_tr, dim)
-        h = torch.cat([h_id, h_query], dim=1)
-        # Transformer processes full sequence
+    def forward(self, x: Tensor, ctx: AttnContext) -> Tensor:
+        """x: (B, D, K) masked one-hot -> (B, D, K) logits."""
+        h = self.embed(x) + self.pos_embed.unsqueeze(0)
         h = self.backbone(h, ctx)
-        # Read off the query positions: (B, n_tr, dim)
-        h_out = h[:, self.n_id:, :]
-        # Per-token projection to K logits: (B, n_tr, K)
-        return self.head(norm(h_out))
+        return self.head(norm(h))
 
 
 # =============================================================================
@@ -270,15 +244,29 @@ class CouplingNet(nn.Module):
 # =============================================================================
 
 def straight_through_one_hot(logits: Tensor, K: int, tau: float = 0.1) -> Tensor:
-    """
-    ST one-hot: forward uses argmax, backward uses softmax(logits/tau).
-
-    logits: (..., K)
-    Returns: (..., K) one-hot with ST gradients
-    """
     soft = F.softmax(logits / tau, dim=-1)
     hard = F.one_hot(logits.argmax(-1), K).float()
     return hard - soft.detach() + soft
+
+
+# =============================================================================
+# Modular Arithmetic in One-Hot Space
+# =============================================================================
+
+def one_hot_add(a: Tensor, b: Tensor) -> Tensor:
+    """(a + b) % K in one-hot space via circular convolution."""
+    return torch.fft.ifft(torch.fft.fft(a) * torch.fft.fft(b)).real
+
+
+def one_hot_minus(inputs: Tensor, shift: Tensor) -> Tensor:
+    """(inputs - shift) % K in one-hot space.
+    Reference: edward2 one_hot_minus — roll-based shift matrix + einsum.
+    """
+    K = inputs.shape[-1]
+    shift_matrix = torch.stack(
+        [shift.roll(i, dims=-1) for i in range(K)], dim=-2
+    )
+    return torch.einsum('...v,...uv->...u', inputs, shift_matrix)
 
 
 # =============================================================================
@@ -287,53 +275,40 @@ def straight_through_one_hot(logits: Tensor, K: int, tau: float = 0.1) -> Tensor
 
 class BipartiteCoupling(nn.Module):
     """
-    Single bipartite coupling layer with modular location shift.
+    Single bipartite coupling layer following the reference exactly.
 
-    Splits dimensions into identity (id_dims) and transform (tr_dims).
-    x_id passes through unchanged; x_tr is shifted by mu(x_id) mod K.
+    mask: (D, 1) — 1 for identity dims, 0 for transform dims.
 
-    sigma = 1 throughout (location-only, as in paper experiments).
+    forward:  output = mask*x + (1-mask) * one_hot_add(loc, x)
+    inverse:  output = mask*x + (1-mask) * one_hot_minus(x, loc)
+
+    loc is conditioned on mask * x (identity dims only).
     """
 
-    def __init__(self, D: int, K: int, id_dims: list, tr_dims: list,
-                 cfg: FlowConfig):
+    def __init__(self, D: int, K: int, mask: Tensor, cfg: FlowConfig):
         super().__init__()
-        self.D = D
         self.K = K
-        self.id_dims = id_dims
-        self.tr_dims = tr_dims
-        self.n_id = len(id_dims)
-        self.n_tr = len(tr_dims)
         self.tau = cfg.tau
+        self.register_buffer('mask', mask.view(D, 1))
+        self.net = CouplingNet(D, K, cfg)
 
-        self.net = CouplingNet(self.n_id, self.n_tr, K, cfg)
-
-    def get_mu_st(self, x_id: Tensor, ctx: AttnContext) -> Tensor:
-        """Get ST one-hot shift parameters. Returns (batch, n_tr, K) in float32."""
-        logits = self.net(x_id, ctx).float()
+    def _get_loc(self, x: Tensor, ctx: AttnContext) -> Tensor:
+        """Compute ST one-hot location shift from masked input.
+        Detach input so each layer's gradient is independent —
+        avoids chaining STE gradients across layers.
+        """
+        logits = self.net((self.mask * x), ctx).float()
         return straight_through_one_hot(logits, self.K, self.tau)
 
     def forward(self, x: Tensor, ctx: AttnContext) -> Tensor:
-        """Forward: y_tr = (x_tr + argmax(mu)) % K. x: (batch, D)"""
-        x_id = x[:, self.id_dims]
-        x_tr = x[:, self.tr_dims]
-        mu_st = self.get_mu_st(x_id, ctx)  # (batch, n_tr, K)
-        mu_hard = mu_st.argmax(-1)  # (batch, n_tr)
-        y_tr = (x_tr + mu_hard) % self.K
-        y = x.clone()
-        y[:, self.tr_dims] = y_tr
-        return y
+        """Forward (generation): y = mask*x + (1-mask)*add(loc, x)."""
+        loc = self._get_loc(x, ctx)
+        return self.mask * x + (1.0 - self.mask) * one_hot_add(loc, x)
 
-    def inverse(self, y: Tensor, ctx: AttnContext) -> Tensor:
-        """Inverse: x_tr = (y_tr - argmax(mu)) % K. y: (batch, D)"""
-        y_id = y[:, self.id_dims]  # identity dims are same in x and y
-        y_tr = y[:, self.tr_dims]
-        mu_st = self.get_mu_st(y_id, ctx)
-        mu_hard = mu_st.argmax(-1)
-        x_tr = (y_tr - mu_hard) % self.K
-        x = y.clone()
-        x[:, self.tr_dims] = x_tr
-        return x
+    def inverse(self, x: Tensor, ctx: AttnContext) -> Tensor:
+        """Inverse (density): z = mask*x + (1-mask)*minus(x, loc)."""
+        loc = self._get_loc(x, ctx)
+        return self.mask * x + (1.0 - self.mask) * one_hot_minus(x, loc)
 
 
 # =============================================================================
@@ -342,13 +317,7 @@ class BipartiteCoupling(nn.Module):
 
 class DiscreteFlow(nn.Module):
     """
-    Composed bipartite discrete flow.
-
-    Base distribution: factorized Categorical with learnable logits.
-    Flow: L bipartite coupling layers with alternating even/odd masks.
-
-    log_prob uses circular convolution of ST shift distributions to
-    propagate gradients through the composed discrete transforms.
+    Composed bipartite discrete flow. Everything in one-hot space.
     """
 
     def __init__(self, D: int, K: int, cfg: FlowConfig):
@@ -357,145 +326,69 @@ class DiscreteFlow(nn.Module):
         self.K = K
         self.cfg = cfg
 
-        # Learnable factorized base distribution
-        self.base_logits = nn.Parameter(torch.zeros(D, K))
+        self.base_logits = nn.Parameter(torch.randn(D, K) * 0.02)
 
-        # Build alternating coupling layers
-        even_dims = list(range(0, D, 2))
-        odd_dims = list(range(1, D, 2))
+        even_mask = torch.zeros(D)
+        even_mask[::2] = 1.0
+        odd_mask = 1.0 - even_mask
 
         self.layers = nn.ModuleList()
         for i in range(cfg.n_flows):
-            if i % 2 == 0:
-                id_dims, tr_dims = even_dims, odd_dims
-            else:
-                id_dims, tr_dims = odd_dims, even_dims
-            self.layers.append(
-                BipartiteCoupling(D, K, id_dims, tr_dims, cfg)
-            )
+            mask = even_mask if i % 2 == 0 else odd_mask
+            self.layers.append(BipartiteCoupling(D, K, mask, cfg))
 
-        # RoPE cache -- seq_len is n_id + n_tr = D for every layer
-        max_seq = D
         head_dim = cfg.head_dim
-        rope_cos, rope_sin = build_rope_cache(max_seq, head_dim, DEVICE)
+        rope_cos, rope_sin = build_rope_cache(D, head_dim, DEVICE)
         self.register_buffer('rope_cos', rope_cos)
         self.register_buffer('rope_sin', rope_sin)
 
-        # Precompute circular convolution index: idx[k, j] = (k - j) % K
-        idx = torch.arange(K).unsqueeze(1) - torch.arange(K).unsqueeze(0)
-        self.register_buffer('circ_idx', idx % K)  # (K, K)
-
-    def _make_ctx(self, seq_len: int) -> AttnContext:
-        return make_ctx(seq_len, self.rope_cos, self.rope_sin)
-
-    def _circ_conv(self, a: Tensor, b: Tensor) -> Tensor:
-        """
-        Circular convolution of two distributions over Z_K.
-
-        a: (..., K) -- distribution of shift A
-        b: (..., K) -- distribution of shift B
-        result[k] = sum_j a[j] * b[(k-j) % K]
-
-        This gives the distribution of (A + B) mod K.
-        """
-        # b_shifted[..., k, j] = b[..., (k-j) % K]
-        b_shifted = b[..., self.circ_idx]  # (..., K, K)
-        return (a.unsqueeze(-2) * b_shifted).sum(-1)  # (..., K)
+    def _ctx(self) -> AttnContext:
+        return AttnContext(rope_cos=self.rope_cos, rope_sin=self.rope_sin)
 
     @torch.compile(fullgraph=True)
     def log_prob(self, y: Tensor) -> Tensor:
         """
-        Differentiable log-probability of data y under the flow.
+        Differentiable log p(y).
 
-        Uses ST shift distributions and circular convolution to propagate
-        gradients through the composed modular-arithmetic transforms.
-
-        y: (batch, D) LongTensor in {0..K-1}
-        Returns: (batch,) log-probabilities
+        y: (batch, D) LongTensor -> (batch,) log-probs
         """
-        B, D, K = y.shape[0], self.D, self.K
-        device = y.device
+        x = F.one_hot(y, self.K).float()
+        ctx = self._ctx()
 
-        # Per-dimension shift distribution, initialized as delta at 0
-        # shift_dist[b, d, k] = P(total shift = k) for dimension d
-        shift_dist = torch.zeros(B, D, K, device=device)
-        shift_dist[:, :, 0] = 1.0
-
-        # Track hard-inverted values for conditioner inputs
-        z = y.clone()
-
-        # Process layers in reverse (inverse direction)
         for layer in reversed(self.layers):
-            tr_dims = layer.tr_dims
-            id_dims = layer.id_dims
+            x = layer.inverse(x, ctx)
 
-            # Get ST one-hot shift from conditioner
-            # seq_len = n_id + n_tr for the query-token architecture
-            ctx = self._make_ctx(layer.n_id + layer.n_tr)
-            mu_st = layer.get_mu_st(z[:, id_dims], ctx)  # (B, n_tr, K)
-
-            # Circular-convolve the shift distribution for transform dims
-            # We accumulate the forward shift mu (not -mu), so that the total
-            # shift T_d satisfies: base_index = (y_d - T_d) % K = z_d
-            cur_shift = shift_dist[:, tr_dims, :]  # (B, n_tr, K)
-            shift_dist = shift_dist.clone()
-            shift_dist[:, tr_dims, :] = self._circ_conv(cur_shift, mu_st)
-
-            # Hard inverse for next layer's conditioner input
-            mu_hard = mu_st.argmax(-1)  # (B, n_tr)
-            z = z.clone()
-            z[:, tr_dims] = (z[:, tr_dims] - mu_hard) % K
-
-        # Compute log prob under base distribution
         log_base = F.log_softmax(self.base_logits.float(), dim=-1)  # (D, K)
-
-        # For each dim d and shift k: base_prob at (y_d - k) % K
-        shift_values = torch.arange(K, device=device)
-        base_indices = (y.unsqueeze(-1) - shift_values.view(1, 1, K)) % K  # (B, D, K)
-        # Gather base log probs
-        log_base_expanded = log_base.unsqueeze(0).expand(B, -1, -1)  # (B, D, K)
-        log_base_at_idx = log_base_expanded.gather(2, base_indices)  # (B, D, K)
-
-        # Weighted sum: sum_k shift_dist[d,k] * exp(log_base[d, (y_d-k)%K])
-        prob_per_dim = (shift_dist * log_base_at_idx.exp()).sum(-1)  # (B, D)
-        # Clamp for log stability
-        log_prob_per_dim = prob_per_dim.clamp(min=1e-30).log()
-
-        return log_prob_per_dim.sum(-1)  # (B,)
-
+        return (log_base.unsqueeze(0) * x).sum(-1).sum(-1)       # (B,)
     @torch.no_grad()
     def sample(self, n: int) -> Tensor:
-        """Sample from the flow by drawing from base and applying forward layers."""
-        # Sample from factorized base
-        base_probs = F.softmax(self.base_logits.float(), dim=-1)  # (D, K)
-        z = torch.multinomial(base_probs.expand(n, -1, -1).reshape(n * self.D, self.K),
-                              1).view(n, self.D)  # (n, D)
+        """Sample n points. Returns (n, D) LongTensor."""
+        base_probs = F.softmax(self.base_logits.float(), dim=-1)
+        z = torch.multinomial(
+            base_probs.expand(n, -1, -1).reshape(n * self.D, self.K), 1
+        ).view(n, self.D)
 
-        # Apply layers in forward order
+        x = F.one_hot(z, self.K).float()
+        ctx = self._ctx()
         for layer in self.layers:
-            ctx = self._make_ctx(layer.n_id + layer.n_tr)
-            z = layer.forward(z, ctx)
+            x = layer.forward(x, ctx)
+        return x.argmax(-1)
 
-        return z
+    @torch.no_grad()
+    def inverse(self, y: Tensor) -> Tensor:
+        """Map observations to base. Returns (n, D) LongTensor."""
+        x = F.one_hot(y, self.K).float()
+        ctx = self._ctx()
+        for layer in reversed(self.layers):
+            x = layer.inverse(x, ctx)
+        return x.argmax(-1)
 
 
 # =============================================================================
-# Training
+# Training Utilities
 # =============================================================================
-
-def _get_learned_joint(model: DiscreteFlow, D: int, K: int,
-                       n_samples: int = 100_000) -> torch.Tensor:
-    """Sample from model and estimate joint distribution. Returns (K^D,) on CPU."""
-    samples = model.sample(n_samples)
-    strides = K ** torch.arange(D - 1, -1, -1, device=samples.device)
-    flat_idx = (samples * strides.unsqueeze(0)).sum(1)
-    counts = torch.zeros(K ** D, device=samples.device)
-    counts.scatter_add_(0, flat_idx, torch.ones(n_samples, device=samples.device))
-    return (counts / n_samples).cpu()
-
 
 def _compute_factorized(probs_flat: torch.Tensor, D: int, K: int) -> torch.Tensor:
-    """Compute product of marginals from a flat joint. Returns (K^D,) on CPU."""
     import numpy as np
     p = probs_flat.cpu().numpy().reshape([K] * D)
     marginals = []
@@ -509,7 +402,6 @@ def _compute_factorized(probs_flat: torch.Tensor, D: int, K: int) -> torch.Tenso
 
 
 def _pairwise_marginal(probs_flat, D, K, di, dj):
-    """K*K marginal for dims (di, dj) from flat joint. Returns numpy array."""
     import numpy as np
     p = probs_flat.cpu().numpy().reshape([K] * D)
     axes = tuple(d for d in range(D) if d != di and d != dj)
@@ -517,7 +409,6 @@ def _pairwise_marginal(probs_flat, D, K, di, dj):
 
 
 def _pairwise_from_samples(samples, K, di, dj):
-    """K*K marginal for dims (di, dj) from model samples. Returns numpy array."""
     n = samples.shape[0]
     idx = samples[:, di] * K + samples[:, dj]
     counts = torch.zeros(K * K, device=samples.device)
@@ -526,7 +417,6 @@ def _pairwise_from_samples(samples, K, di, dj):
 
 
 def _top_pairs_by_mi(probs_flat, D, K, max_pairs=4):
-    """Select dimension pairs with highest mutual information."""
     import numpy as np
     pairs = []
     for i in range(D):
@@ -545,7 +435,6 @@ def _bubble_panel(ax, mat, title, subtitle, cmap, bg, fg, grid_color,
                   vmin=None, vmax=None, diverging=False,
                   show_cbar=False, cbar_ax=None,
                   xlabel="$x_1$", ylabel="$x_0$"):
-    """Bubble chart on a discrete grid (from figure_twitter.py style)."""
     import matplotlib.colors as mcolors
     from matplotlib.patches import Circle
 
@@ -599,7 +488,6 @@ def _bubble_panel(ax, mat, title, subtitle, cmap, bg, fg, grid_color,
 
 def plot_training(losses: list, model: DiscreteFlow, data: FullRankDiscrete,
                   step: int, n_iter: int, tag: str = "training"):
-    """Save {tag}.jpg: 16:9 — loss on top, bubble rows below."""
     import numpy as np
 
     bg, fg, accent = "#0f1117", "#e8e8ec", "#6c9cfc"
@@ -613,15 +501,10 @@ def plot_training(losses: list, model: DiscreteFlow, data: FullRankDiscrete,
     })
 
     D, K = data.D, data.K
-
-    # Top-2 MI pairs (1 if D=2 since there's only 1 pair)
     pairs = _top_pairs_by_mi(data.probs, D, K, max_pairs=2)
     n_pair_rows = len(pairs)
-
-    # Learned samples for marginal estimation
     samples = model.sample(100_000)
 
-    # 16:9 — row 0 = loss (full width), rows 1+ = bubble triples
     fig = plt.figure(figsize=(16, 9))
     n_grid_rows = 1 + n_pair_rows
     height_ratios = [1.0] + [1.2] * n_pair_rows
@@ -637,7 +520,6 @@ def plot_training(losses: list, model: DiscreteFlow, data: FullRankDiscrete,
              f"step {step}/{n_iter}", ha="center", fontsize=15,
              fontweight="bold", color=fg)
 
-    # --- Loss curve (top row, spans bubble columns) ---
     ax_loss = fig.add_subplot(gs[0, :3])
     ax_loss.set_facecolor(bg)
     steps_arr = np.arange(1, len(losses) + 1)
@@ -668,9 +550,8 @@ def plot_training(losses: list, model: DiscreteFlow, data: FullRankDiscrete,
     for spine in ax_loss.spines.values():
         spine.set_color(grid_color)
 
-    # --- Pairwise marginal bubble charts (below loss) ---
     for pidx, (di, dj) in enumerate(pairs):
-        grow = 1 + pidx  # grid row (0 is loss)
+        grow = 1 + pidx
 
         true_marg = _pairwise_marginal(data.probs, D, K, di, dj)
         learned_marg = _pairwise_from_samples(samples, K, di, dj)
@@ -711,12 +592,15 @@ def plot_training(losses: list, model: DiscreteFlow, data: FullRankDiscrete,
     plt.rcParams.update(prev)
 
 
+# =============================================================================
+# Training
+# =============================================================================
+
 def train(model: DiscreteFlow, data: FullRankDiscrete,
           n_iter: int = 20000, batch_size: int = 512, lr: float = 1e-3,
           warmup_frac: float = 0.05, max_grad_norm: float = 1.0,
-          log_every: int = 500, plot_every: int = 500,
+          log_every: int = 100, plot_every: int = 500,
           tag: str = "training"):
-    """Train the discrete flow with maximum likelihood."""
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     warmup = int(n_iter * warmup_frac)
@@ -731,6 +615,9 @@ def train(model: DiscreteFlow, data: FullRankDiscrete,
     pbar = trange(n_iter, desc=f"D={data.D} K={data.K}")
     best_nll = float('inf')
     losses = []
+
+    D, K = data.D, data.K
+    strides = K ** torch.arange(D - 1, -1, -1, device=data.device)
 
     for i in pbar:
         y = data.sample(batch_size)
@@ -748,8 +635,31 @@ def train(model: DiscreteFlow, data: FullRankDiscrete,
 
         if (i + 1) % log_every == 0:
             best_nll = min(best_nll, nll)
+            model.eval()
+            with torch.no_grad():
+                # Round-trip test
+                y_test = data.sample(2048)
+                z_inv = model.inverse(y_test)
+                ctx = model._ctx()
+                y_rt = F.one_hot(z_inv, K).float()
+                for layer in model.layers:
+                    y_rt = layer.forward(y_rt, ctx)
+                rt_acc = (y_rt.argmax(-1) == y_test).all(dim=1).float().mean().item()
+
+                # TV distance
+                n_tv = 50_000
+                samples = model.sample(n_tv)
+                flat_idx = (samples * strides.unsqueeze(0)).sum(1)
+                counts = torch.zeros(K ** D, device=samples.device)
+                counts.scatter_add_(0, flat_idx,
+                                    torch.ones(n_tv, device=samples.device))
+                p_model = counts / n_tv
+                tv = 0.5 * (data.probs - p_model).abs().sum().item()
+            model.train()
+
             pbar.set_postfix(nll=f"{nll:.3f}", H=f"{data.entropy:.3f}",
-                             gap=f"{nll - data.entropy:.3f}")
+                             gap=f"{nll - data.entropy:.3f}",
+                             rt=f"{rt_acc:.3f}", tv=f"{tv:.3f}")
 
         if (i + 1) % plot_every == 0 or (i + 1) == n_iter:
             model.eval()
@@ -765,12 +675,11 @@ def train(model: DiscreteFlow, data: FullRankDiscrete,
 # =============================================================================
 
 if __name__ == "__main__":
-    # Paper Table 1 settings
     settings = [
-        (2,  2,  20_000),
-        (5,  5,  40_000),
-        (5,  10, 40_000),
-        (10, 5,  60_000),
+        #(2,  2,  5_000),
+        (5,  5,  20_000),
+        #(5,  10, 40_000),
+        #(10, 5,  60_000),
     ]
 
     results = {}
@@ -780,7 +689,7 @@ if __name__ == "__main__":
         print(f"\n--- {tag} ---")
         cfg = FlowConfig(
             n_flows=4,
-            tau=0.1,
+            tau=1.0,
         )
 
         data = FullRankDiscrete(D, K, seed=118, device=DEVICE)
@@ -794,7 +703,6 @@ if __name__ == "__main__":
                          tag=tag)
         results[(D, K)] = best_nll
 
-        # Final evaluation on large batch
         model.eval()
         with torch.no_grad():
             y_eval = data.sample(4096)
@@ -804,7 +712,6 @@ if __name__ == "__main__":
         print(f"  Final NLL: {final_nll:.3f} | H(p*): {data.entropy:.3f} | "
               f"Gap: {final_nll - data.entropy:.3f}")
 
-    # Summary table
     print("\n" + "=" * 60)
     print("Summary (nats)")
     print("=" * 60)
