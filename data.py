@@ -1,5 +1,6 @@
 """
 Full-Rank Discrete Distribution
+================================
 
 Draws a random joint distribution over K^D outcomes from Dirichlet(1),
 then samples from it. The distribution has arbitrary correlations that
@@ -32,6 +33,9 @@ class FullRankDiscrete:
         gamma = torch.zeros(K ** D).exponential_(generator=rng)
         self.probs = (gamma / gamma.sum()).to(device)  # (K^D,)
 
+        # Strides for flat <-> multi-index conversion: [K^(D-1), K^(D-2), ..., K^0]
+        self.strides = K ** torch.arange(D - 1, -1, -1, device=device)  # (D,)
+
         # Precompute entropy (best achievable NLL per sample)
         mask = self.probs > 0
         self.entropy = -(self.probs[mask] * self.probs[mask].log()).sum().item()
@@ -39,19 +43,12 @@ class FullRankDiscrete:
     def sample(self, n: int) -> Tensor:
         """Sample (n, D) LongTensor from the ground-truth distribution."""
         flat = torch.multinomial(self.probs, n, replacement=True)  # (n,)
-        # Decode flat index -> multi-dim index via repeated div/mod
-        x = torch.zeros(n, self.D, dtype=torch.long, device=self.device)
-        remainder = flat
-        for d in range(self.D - 1, -1, -1):
-            x[:, d] = remainder % self.K
-            remainder = remainder // self.K
-        return x
+        # Decode flat index -> multi-dim index: x[:,d] = (flat // strides[d]) % K
+        return (flat.unsqueeze(1) // self.strides.unsqueeze(0)) % self.K
 
     def nll(self, x: Tensor) -> Tensor:
         """Ground-truth NLL per sample, averaged. x: (n, D) LongTensor."""
-        flat = torch.zeros(x.shape[0], dtype=torch.long, device=self.device)
-        for d in range(self.D):
-            flat = flat * self.K + x[:, d]
+        flat = (x * self.strides.unsqueeze(0)).sum(dim=1)  # (n,)
         return -self.probs[flat].log().mean()
 
 
