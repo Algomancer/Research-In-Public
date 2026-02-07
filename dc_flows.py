@@ -435,14 +435,11 @@ class DiscreteFlow(nn.Module):
             mu_st = layer.get_mu_st(z[:, id_dims], ctx)  # (B, n_tr, K)
 
             # Circular-convolve the shift distribution for transform dims
-            # The inverse shift is -mu, so we need to convolve with the
-            # distribution of -mu: if mu has mass at k, -mu has mass at (-k)%K
-            neg_idx = (-torch.arange(K, device=device)) % K
-            neg_mu_st = mu_st[:, :, neg_idx]  # (B, n_tr, K)
-
+            # We accumulate the forward shift mu (not -mu), so that the total
+            # shift T_d satisfies: base_index = (y_d - T_d) % K = z_d
             cur_shift = shift_dist[:, tr_dims, :]  # (B, n_tr, K)
             shift_dist = shift_dist.clone()
-            shift_dist[:, tr_dims, :] = self._circ_conv(cur_shift, neg_mu_st)
+            shift_dist[:, tr_dims, :] = self._circ_conv(cur_shift, mu_st)
 
             # Hard inverse for next layer's conditioner input
             mu_hard = mu_st.argmax(-1)  # (B, n_tr)
@@ -770,7 +767,7 @@ def train(model: DiscreteFlow, data: FullRankDiscrete,
 if __name__ == "__main__":
     # Paper Table 1 settings
     settings = [
-        (2,  2,  5_000),
+        (2,  2,  20_000),
         (5,  5,  40_000),
         (5,  10, 40_000),
         (10, 5,  60_000),
@@ -793,7 +790,7 @@ if __name__ == "__main__":
         n_params = sum(p.numel() for p in model.parameters())
         print(f"  Parameters: {n_params:,}  flows={cfg.n_flows}  tau={cfg.tau}")
 
-        best_nll = train(model, data, n_iter=n_iter, batch_size=512, lr=1e-3,
+        best_nll = train(model, data, n_iter=n_iter, batch_size=512, lr=1e-4,
                          tag=tag)
         results[(D, K)] = best_nll
 
